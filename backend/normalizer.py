@@ -17,49 +17,121 @@ def detect_line_color_hex(img_bgr: np.ndarray, line_mask: np.ndarray) -> str:
     b, g, r = int(median_color[0]), int(median_color[1]), int(median_color[2])
     return f"#{r:02x}{g:02x}{b:02x}"
 
-def find_line_top_edge(line_mask: np.ndarray) -> np.ndarray:
+def detect_line_mask(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Her x sütununda çizginin en üst pikselini bulur.
-    Döndürür: shape (width,) array, her sütun için y koordinatı (bulunamazsa -1)
+    Görüntüdeki çizgiyi tespit eder.
+    Önce koyu/renkli pikselleri (arka plan değil) bulmaya çalışır.
+    Arka plan: beyaz (255,255,255 civarı) veya bej/krem ([240,224,199] civarı)
+    """
+    img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    # --- Beyaz arka plan maskesi ---
+    lower_white = np.array([0, 0, 200])
+    upper_white = np.array([180, 40, 255])
+    white_mask = cv2.inRange(img_hsv, lower_white, upper_white)
+
+    # --- Bej/krem arka plan maskesi (RGB ~240,224,199) ---
+    # HSV'de bej: düşük satürasyon, yüksek value, sarımsı hue
+    lower_beige = np.array([10, 10, 180])
+    upper_beige = np.array([35, 80, 255])
+    beige_mask = cv2.inRange(img_hsv, lower_beige, upper_beige)
+
+    # --- Sarı arka plan maskesi ---
+    lower_yellow = np.array([15, 50, 150])
+    upper_yellow = np.array([40, 255, 255])
+    yellow_mask = cv2.inRange(img_hsv, lower_yellow, upper_yellow)
+
+    # Arka plan = beyaz + bej + sarı
+    background_mask = cv2.bitwise_or(white_mask, beige_mask)
+    background_mask = cv2.bitwise_or(background_mask, yellow_mask)
+
+    # Morfolojik genişletme: arka plan boşluklarını kapat
+    kernel_bg = np.ones((5, 5), np.uint8)
+    background_mask = cv2.dilate(background_mask, kernel_bg, iterations=2)
+
+    # Çizgi maskesi = arka plan olmayan piksel
+    line_mask = cv2.bitwise_not(background_mask)
+
+    # Morfolojik temizleme: küçük gürültüleri sil
+    kernel_clean = np.ones((3, 3), np.uint8)
+    line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_OPEN, kernel_clean)
+    line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, kernel_clean)
+
+    return line_mask
+
+def extract_line_points(line_mask: np.ndarray):
+    """
+    Her x sütununda çizgi piksellerinin median y koordinatını çıkarır.
+    Outlier filtrelemesi uygular.
+    Döndürür: (xs, ys) array çifti
     """
     height, width = line_mask.shape
-    top_edge = np.full(width, -1, dtype=np.float64)
+    points_x = []
+    points_y = []
+
     for x in range(width):
         col = line_mask[:, x]
-        ys = np.where(col > 0)[0]
-        if len(ys) > 0:
-            top_edge[x] = float(ys[0])
-    return top_edge
+        y_coords = np.where(col > 0)[0]
+        if len(y_coords) > 0:
+            y_val = float(np.median(y_coords))
+            points_x.append(x)
+            points_y.append(y_val)
 
-def smooth_top_edge(top_edge: np.ndarray, window_length: int = 51, polyorder: int = 3) -> np.ndarray:
+    if len(points_x) < 10:
+        return np.array(points_x), np.array(points_y)
+
+    xs = np.array(points_x)
+    ys = np.array(points_y)
+
+    # Outlier temizleme: komşu noktadan çok farklı olanları sil
+    diffs = np.abs(np.diff(ys))
+    # İlk eleman için diff ekle
+    diffs = np.concatenate([[0], diffs])
+    valid = diffs < 30  # 30 piksel'den fazla sıçrama = outlier
+    xs = xs[valid]
+    ys = ys[valid]
+
+    return xs, ys
+
+def smooth_line_points(xs: np.ndarray, ys: np.ndarray, width: int):
     """
-    Savitzky-Golay filtresi ile üst kenar eğrisini düzleştirir.
-    Sadece geçerli (>= 0) noktaları kullanır, boşlukları interpolasyon ile doldurur.
+    Savitzky-Golay filtresi ile çizgi noktalarını düzleştirir.
+    Tüm x pozisyonları için interpolasyon yapar.
+    Döndürür: (full_xs, smoothed_ys, error_margin) — tüm genişlik için
     """
-    width = len(top_edge)
-    valid = top_edge >= 0
-    if np.sum(valid) < window_length:
-        return top_edge.copy()
+    if len(xs) < 10:
+        full_xs = np.arange(width)
+        return full_xs, np.full(width, -1.0), np.zeros(width)
 
-    xs = np.arange(width)
-    # Boşlukları lineer interpolasyon ile doldur
-    filled = top_edge.copy()
-    filled[~valid] = np.interp(xs[~valid], xs[valid], top_edge[valid])
-
-    # Pencere boyutu tek sayı olmalı
-    wl = min(window_length, width)
+    # Pencere boyutu
+    wl = min(51, len(xs))
     if wl % 2 == 0:
         wl -= 1
-    if wl < polyorder + 2:
-        return filled
+    if wl < 5:
+        wl = 5
 
-    smoothed = savgol_filter(filled, window_length=wl, polyorder=polyorder)
-    return smoothed
+    try:
+        ys_smooth = savgol_filter(ys, window_length=wl, polyorder=3)
+    except Exception:
+        ys_smooth = ys.copy()
+
+    # Hata payı hesapla
+    error_margin = np.abs(ys - ys_smooth)
+    # Rolling ortalama ile yumuşat
+    window = 20
+    error_smooth = np.convolve(error_margin, np.ones(window)/window, mode='same')
+
+    # Tüm x genişliği için interpolasyon
+    full_xs = np.arange(width)
+    full_ys = np.interp(full_xs, xs, ys_smooth, left=-1, right=-1)
+    full_err = np.interp(full_xs, xs, error_smooth, left=0, right=0)
+
+    return full_xs, full_ys, full_err
 
 def normalize_line_color(img_bgr: np.ndarray):
     """
-    Rolling window ile çizgi renklerini normalize eder ve
-    çizginin üst kenarına düzgün bir kırmızı çizgi çizer.
+    Çizgiyi tespit eder, rengini normalize eder ve
+    çizginin üstüne kırmızı hat + güven bandı çizer.
 
     Döndürdükleri:
         normalized_bgr: normalize edilmiş görüntü (kırmızı üst kenar çizgisi dahil)
@@ -70,68 +142,63 @@ def normalize_line_color(img_bgr: np.ndarray):
     """
     start_time = time.time()
 
-    img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    height, width = img_bgr.shape[:2]
 
-    # Sarı arka plan maskesi (HSV'de sarı aralığı)
-    lower_yellow = np.array([15, 50, 150])
-    upper_yellow = np.array([40, 255, 255])
-    yellow_mask = cv2.inRange(img_hsv, lower_yellow, upper_yellow)
+    # 1. Çizgi maskesini tespit et
+    line_mask = detect_line_mask(img_bgr)
 
-    # Beyaz/açık renk maskesi (grid çizgileri)
-    lower_white = np.array([0, 0, 200])
-    upper_white = np.array([180, 30, 255])
-    white_mask = cv2.inRange(img_hsv, lower_white, upper_white)
-
-    # Arka plan = sarı + beyaz
-    background_mask = cv2.bitwise_or(yellow_mask, white_mask)
-
-    # Çizgi maskesi = arka plan olmayan piksel
-    line_mask = cv2.bitwise_not(background_mask)
-
-    # Morfolojik işlem ile gürültüyü temizle
-    kernel = np.ones((2, 2), np.uint8)
-    line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_OPEN, kernel)
-
-    # Tespit edilen rengi hesapla (normalleştirme öncesi)
+    # 2. Tespit edilen rengi hesapla
     detected_color = detect_line_color_hex(img_bgr, line_mask)
 
-    # Toplam çizgi piksel sayısı
+    # 3. Toplam çizgi piksel sayısı
     line_pixel_count = int(np.sum(line_mask > 0))
 
-    # Çıktı görüntüsünü oluştur
+    # 4. Çıktı görüntüsünü oluştur
     output = img_bgr.copy()
 
-    # Hedef renk: koyu lacivert (BGR: 110, 26, 26) → #1a1a6e
+    # 5. Hedef renk: koyu lacivert (BGR: 110, 26, 26) → #1a1a6e
     target_color_bgr = (110, 26, 26)
 
-    # Rolling window ile normalize et
-    height, width = img_bgr.shape[:2]
-    window_size = max(50, min(100, width // 20))
+    # 6. Çizgi piksellerini normalize et
+    line_pixels_y, line_pixels_x = np.where(line_mask > 0)
+    if len(line_pixels_y) > 0:
+        output[line_pixels_y, line_pixels_x] = target_color_bgr
 
-    for x_start in range(0, width, window_size):
-        x_end = min(x_start + window_size, width)
-        window_mask = line_mask[:, x_start:x_end]
+    # 7. Çizgi noktalarını çıkar (median y per x)
+    xs, ys = extract_line_points(line_mask)
 
-        if np.sum(window_mask) > 0:
-            line_pixels_y, line_pixels_x = np.where(window_mask > 0)
-            if len(line_pixels_y) > 0:
-                output[line_pixels_y, line_pixels_x + x_start] = target_color_bgr
+    if len(xs) >= 10:
+        # 8. Düzleştir ve hata payını hesapla
+        full_xs, smoothed_ys, error_margin = smooth_line_points(xs, ys, width)
 
-    # Çizginin üst kenarını bul ve kırmızı çizgi çiz
-    top_edge = find_line_top_edge(line_mask)
-    smoothed_edge = smooth_top_edge(top_edge, window_length=101, polyorder=3)
+        # 9. Güven bandı çiz (sarı, yarı saydam görünüm için açık sarı BGR)
+        band_color_upper = (0, 220, 255)  # açık sarı/turuncu (BGR)
+        band_color_lower = (0, 220, 255)
+        line_thickness = max(3, height // 150)
+        band_thickness = max(1, height // 400)
 
-    # Kırmızı çizgiyi çiz (BGR: 0, 0, 255)
-    red_color = (0, 0, 255)
-    line_thickness = max(2, height // 200)  # Görüntü boyutuna göre kalınlık
+        for x in range(width):
+            y_center = smoothed_ys[x]
+            if y_center < 0:
+                continue
+            err = error_margin[x]
 
-    for x in range(width):
-        y = smoothed_edge[x]
-        if y >= 0:
-            y_int = int(round(y))
-            y_start = max(0, y_int - line_thickness // 2)
-            y_end = min(height, y_int + line_thickness // 2 + 1)
-            output[y_start:y_end, x] = red_color
+            y_upper = int(round(max(0, y_center - err)))
+            y_lower = int(round(min(height - 1, y_center + err)))
+
+            # Güven bandı (ince sarı çizgiler)
+            output[max(0, y_upper - band_thickness):y_upper + band_thickness, x] = band_color_upper
+            output[y_lower - band_thickness:min(height, y_lower + band_thickness), x] = band_color_lower
+
+        # 10. Kırmızı ana hat çiz
+        red_color = (0, 0, 255)
+        for x in range(width):
+            y = smoothed_ys[x]
+            if y >= 0:
+                y_int = int(round(y))
+                y_start = max(0, y_int - line_thickness // 2)
+                y_end = min(height, y_int + line_thickness // 2 + 1)
+                output[y_start:y_end, x] = red_color
 
     normalized_color = "#1a1a6e"
     processing_time = time.time() - start_time
@@ -147,7 +214,6 @@ def load_image_as_bgr(file_bytes: bytes) -> np.ndarray:
         img_array = np.array(pil_img)
 
     if img_array.dtype != np.uint8:
-        # 16-bit veya float görüntüleri uint8'e dönüştür
         img_min, img_max = img_array.min(), img_array.max()
         if img_max > img_min:
             img_array = ((img_array - img_min) / (img_max - img_min) * 255).astype(np.uint8)
