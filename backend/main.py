@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -28,8 +30,6 @@ async def normalize_image(file: UploadFile = File(...)):
     TIF/PNG/JPG görüntüsündeki çizgi rengini normalize eder.
     Orijinal ve normalize edilmiş görüntüleri base64 olarak döndürür.
     """
-    import os
-
     # Dosya uzantısı kontrolü
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
