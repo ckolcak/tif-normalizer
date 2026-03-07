@@ -18,39 +18,29 @@ def detect_line_color_hex(img_bgr: np.ndarray, line_mask: np.ndarray) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 def detect_line_mask(img_bgr: np.ndarray) -> np.ndarray:
-    """
-    Görüntüdeki mavi/koyu çizgiyi tespit eder.
-    Arka plan: beyaz veya bej/krem
-    Çizgi: mavi, lacivert, koyu gibi piksel
-    """
     img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-    # --- Mavi çizgi maskesi ---
-    lower_blue = np.array([90, 30, 30])
+    lower_blue = np.array([90, 25, 25])
     upper_blue = np.array([160, 255, 255])
     blue_mask = cv2.inRange(img_hsv, lower_blue, upper_blue)
 
-    # --- Koyu çizgi maskesi ---
     lower_dark = np.array([0, 0, 0])
-    upper_dark = np.array([180, 255, 120])
+    upper_dark = np.array([180, 255, 110])
     dark_mask = cv2.inRange(img_hsv, lower_dark, upper_dark)
 
-    # Çizgi = mavi VEYA koyu
     line_mask = cv2.bitwise_or(blue_mask, dark_mask)
 
-    # --- Arka plan maskesi ---
-    lower_white = np.array([0, 0, 200])
+    lower_white = np.array([0, 0, 195])
     upper_white = np.array([180, 40, 255])
     white_mask = cv2.inRange(img_hsv, lower_white, upper_white)
 
-    lower_beige = np.array([10, 10, 160])
-    upper_beige = np.array([35, 80, 255])
+    lower_beige = np.array([10, 10, 155])
+    upper_beige = np.array([35, 85, 255])
     beige_mask = cv2.inRange(img_hsv, lower_beige, upper_beige)
 
-    # Kırmızı grid çizgileri
-    lower_red1 = np.array([0, 40, 100])
+    lower_red1 = np.array([0, 40, 90])
     upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, 40, 100])
+    lower_red2 = np.array([170, 40, 90])
     upper_red2 = np.array([180, 255, 255])
     red_mask = cv2.bitwise_or(
         cv2.inRange(img_hsv, lower_red1, upper_red1),
@@ -60,7 +50,9 @@ def detect_line_mask(img_bgr: np.ndarray) -> np.ndarray:
     background_mask = cv2.bitwise_or(white_mask, beige_mask)
     background_mask = cv2.bitwise_or(background_mask, red_mask)
 
-    # Çizgi maskesinden arka planı çıkar
+    kernel_bg = np.ones((3, 3), np.uint8)
+    background_mask = cv2.dilate(background_mask, kernel_bg, iterations=1)
+
     line_mask = cv2.bitwise_and(line_mask, cv2.bitwise_not(background_mask))
 
     kernel = np.ones((2, 2), np.uint8)
@@ -70,10 +62,6 @@ def detect_line_mask(img_bgr: np.ndarray) -> np.ndarray:
     return line_mask
 
 def extract_line_points(line_mask: np.ndarray):
-    """
-    Her x sütununda çizgi piksellerinin median y koordinatını çıkarır.
-    Outlier filtrelemesi uygular.
-    """
     height, width = line_mask.shape
     points_x = []
     points_y = []
@@ -89,27 +77,40 @@ def extract_line_points(line_mask: np.ndarray):
     if len(points_x) < 10:
         return np.array(points_x), np.array(points_y)
 
-    xs = np.array(points_x)
-    ys = np.array(points_y)
+    xs = np.array(points_x, dtype=np.float64)
+    ys = np.array(points_y, dtype=np.float64)
 
+    # 1. Tur: büyük sıçramaları sil (50px)
     diffs = np.abs(np.diff(ys))
     diffs = np.concatenate([[0], diffs])
-    valid = diffs < 30
+    valid = diffs < 50
     xs = xs[valid]
     ys = ys[valid]
+
+    if len(xs) < 10:
+        return xs, ys
+
+    # 2. Tur: rolling median ile outlier tespiti (MAD tabanlı)
+    window = 20
+    ys_smooth_check = np.array([
+        np.median(ys[max(0, i - window):i + window + 1])
+        for i in range(len(ys))
+    ])
+    residuals = np.abs(ys - ys_smooth_check)
+    mad = np.median(residuals)
+    threshold = max(15, mad * 3.5)
+    valid2 = residuals < threshold
+    xs = xs[valid2]
+    ys = ys[valid2]
 
     return xs, ys
 
 def smooth_line_points(xs: np.ndarray, ys: np.ndarray, width: int):
-    """
-    Savitzky-Golay filtresi ile çizgi noktalarını düzleştirir.
-    Döndürür: (full_xs, smoothed_ys, error_margin)
-    """
     if len(xs) < 10:
         full_xs = np.arange(width)
         return full_xs, np.full(width, -1.0), np.zeros(width)
 
-    wl = min(51, len(xs))
+    wl = min(101, len(xs))
     if wl % 2 == 0:
         wl -= 1
     if wl < 5:
@@ -121,39 +122,25 @@ def smooth_line_points(xs: np.ndarray, ys: np.ndarray, width: int):
         ys_smooth = ys.copy()
 
     error_margin = np.abs(ys - ys_smooth)
-    window = 20
-    error_smooth = np.convolve(error_margin, np.ones(window) / window, mode='same')
+    window_conv = 30
+    error_smooth = np.convolve(error_margin, np.ones(window_conv) / window_conv, mode='same')
 
     full_xs = np.arange(width)
-    full_ys = np.interp(full_xs, xs, ys_smooth, left=-1, right=-1)
-    full_err = np.interp(full_xs, xs, error_smooth, left=0, right=0)
+    full_ys = np.interp(full_xs, xs, ys_smooth)
+    full_err = np.interp(full_xs, xs, error_smooth)
 
     return full_xs, full_ys, full_err
 
 def normalize_line_color(img_bgr: np.ndarray):
-    """
-    Mavi çizgiyi tespit eder, orijinal görüntü üzerine:
-      - Sarı güven bandı (hata payı) çizer
-      - Kırmızı ana hat (jilet gibi düzgün) çizer
-    Mavi çizgi olduğu gibi kalır, kırmızı onun üstüne çizilir.
-    """
     start_time = time.time()
 
     height, width = img_bgr.shape[:2]
 
-    # 1. Mavi çizgi maskesi
     line_mask = detect_line_mask(img_bgr)
-
-    # 2. Tespit edilen renk
     detected_color = detect_line_color_hex(img_bgr, line_mask)
-
-    # 3. Piksel sayısı
     line_pixel_count = int(np.sum(line_mask > 0))
-
-    # 4. Orijinal görüntüyü koru
     output = img_bgr.copy()
 
-    # 5. Çizgi noktalarını çıkar
     xs, ys = extract_line_points(line_mask)
 
     if len(xs) >= 10:
@@ -162,8 +149,7 @@ def normalize_line_color(img_bgr: np.ndarray):
         line_thickness = max(3, height // 150)
         band_thickness = max(2, height // 300)
 
-        # 6. Sarı güven bandı
-        yellow_color = (0, 200, 255)  # BGR: sarı
+        yellow_color = (0, 200, 255)
         for x in range(width):
             y_center = smoothed_ys[x]
             if y_center < 0:
@@ -174,7 +160,6 @@ def normalize_line_color(img_bgr: np.ndarray):
             output[max(0, y_upper - band_thickness):y_upper + band_thickness + 1, x] = yellow_color
             output[max(0, y_lower - band_thickness):y_lower + band_thickness + 1, x] = yellow_color
 
-        # 7. Kırmızı ana hat (mavi çizginin üstüne)
         red_color = (0, 0, 255)
         for x in range(width):
             y = smoothed_ys[x]
@@ -190,7 +175,6 @@ def normalize_line_color(img_bgr: np.ndarray):
     return output, detected_color, normalized_color, line_pixel_count, processing_time
 
 def load_image_as_bgr(file_bytes: bytes) -> np.ndarray:
-    """Dosya byte'larından BGR numpy dizisi yükler."""
     try:
         img_array = tifffile.imread(BytesIO(file_bytes))
     except Exception:
@@ -216,7 +200,6 @@ def load_image_as_bgr(file_bytes: bytes) -> np.ndarray:
     return img_bgr
 
 def bgr_to_base64_png(img_bgr: np.ndarray) -> str:
-    """BGR numpy dizisini base64 PNG string'e çevirir."""
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img_rgb)
     buffer = BytesIO()
